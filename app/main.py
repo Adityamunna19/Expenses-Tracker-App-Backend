@@ -8,12 +8,13 @@ from io import StringIO
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
 from app.database import get_connection, init_db
 from app.schemas import (
+    AuthTokenResponse,
     DashboardResponse,
     Expense,
     ExpenseCreate,
@@ -26,6 +27,16 @@ from app.schemas import (
     ReceivableReminderCreate,
     ReceivableReminderReceive,
     SavingsDashboardResponse,
+    UserLogin,
+    UserProfile,
+    UserRegister,
+)
+from app.services.auth import (
+    build_session_expiry,
+    generate_session_token,
+    hash_password,
+    hash_session_token,
+    verify_password,
 )
 from app.services.parser import parse_expense_input
 
@@ -41,6 +52,48 @@ def get_allowed_origins() -> list[str]:
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def get_bearer_token(authorization: str | None = Header(default=None)) -> str:
+    if not authorization:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication token")
+    return token
+
+
+def get_current_user(token: str = Depends(get_bearer_token)) -> dict[str, Any]:
+    token_hash = hash_session_token(token)
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT u.id, u.email, u.created_at, s.id AS session_id, s.expires_at
+            FROM auth_sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token_hash = ?
+            """,
+            (token_hash,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication token")
+        expires_at = datetime.fromisoformat(row["expires_at"])
+        if expires_at <= utc_now():
+            connection.execute("DELETE FROM auth_sessions WHERE id = ?", (row["session_id"],))
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired")
+    return {
+        "id": row["id"],
+        "email": row["email"],
+        "created_at": row["created_at"],
+    }
+
+
+def serialize_user(row: dict[str, Any] | Any) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "email": row["email"],
+        "created_at": row["created_at"],
+    }
 
 
 app = FastAPI(title="Expenses Tracker API", version="1.0.0")
@@ -64,8 +117,97 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/auth/register", response_model=AuthTokenResponse, status_code=201)
+def register(payload: UserRegister) -> dict[str, Any]:
+    normalized_email = payload.email.lower()
+    password_hash = hash_password(payload.password)
+    session_token = generate_session_token()
+    expires_at = build_session_expiry()
+
+    with get_connection() as connection:
+        existing = connection.execute(
+            "SELECT id FROM users WHERE email = ?",
+            (normalized_email,),
+        ).fetchone()
+        if existing is not None:
+            raise HTTPException(status_code=409, detail="Email is already registered")
+
+        cursor = connection.execute(
+            """
+            INSERT INTO users (email, password_hash)
+            VALUES (?, ?)
+            """,
+            (normalized_email, password_hash),
+        )
+        user_id = cursor.lastrowid
+        connection.execute(
+            """
+            INSERT INTO auth_sessions (user_id, token_hash, expires_at)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, hash_session_token(session_token), expires_at.isoformat()),
+        )
+        user = connection.execute(
+            "SELECT id, email, created_at FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+
+    return {
+        "access_token": session_token,
+        "token_type": "bearer",
+        "user": serialize_user(user),
+    }
+
+
+@app.post("/auth/login", response_model=AuthTokenResponse)
+def login(payload: UserLogin) -> dict[str, Any]:
+    normalized_email = payload.email.lower()
+    session_token = generate_session_token()
+    expires_at = build_session_expiry()
+
+    with get_connection() as connection:
+        user = connection.execute(
+            "SELECT id, email, password_hash, created_at FROM users WHERE email = ?",
+            (normalized_email,),
+        ).fetchone()
+        if user is None or not verify_password(payload.password, user["password_hash"]):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+
+        connection.execute(
+            """
+            INSERT INTO auth_sessions (user_id, token_hash, expires_at)
+            VALUES (?, ?, ?)
+            """,
+            (user["id"], hash_session_token(session_token), expires_at.isoformat()),
+        )
+
+    return {
+        "access_token": session_token,
+        "token_type": "bearer",
+        "user": serialize_user(user),
+    }
+
+
+@app.get("/auth/me", response_model=UserProfile)
+def get_me(current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    return current_user
+
+
+@app.post("/auth/logout", status_code=204, response_class=Response)
+def logout(token: str = Depends(get_bearer_token)) -> Response:
+    with get_connection() as connection:
+        connection.execute(
+            "DELETE FROM auth_sessions WHERE token_hash = ?",
+            (hash_session_token(token),),
+        )
+    return Response(status_code=204)
+
+
 @app.post("/parse-expense", response_model=ParsedExpense)
-def parse_expense(payload: ParseExpenseRequest) -> dict[str, object]:
+def parse_expense(
+    payload: ParseExpenseRequest,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, object]:
     try:
         return parse_expense_input(payload.input)
     except ValueError as exc:
@@ -76,6 +218,7 @@ def parse_expense(payload: ParseExpenseRequest) -> dict[str, object]:
 def list_expenses(
     category: str | None = None,
     limit: int = Query(default=100, ge=1, le=500),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
     query = """
         SELECT
@@ -88,9 +231,9 @@ def list_expenses(
             expense_at,
             created_at
         FROM transactions
-        WHERE status != 'ignored'
+        WHERE status != 'ignored' AND user_id = ?
     """
-    params: list[Any] = []
+    params: list[Any] = [current_user["id"]]
     if category:
         query += " AND category = ?"
         params.append(category)
@@ -103,7 +246,10 @@ def list_expenses(
 
 
 @app.get("/credits", response_model=list[Expense])
-def list_credits(limit: int = Query(default=100, ge=1, le=500)) -> list[dict[str, Any]]:
+def list_credits(
+    limit: int = Query(default=100, ge=1, le=500),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> list[dict[str, Any]]:
     with get_connection() as connection:
         rows = connection.execute(
             """
@@ -117,17 +263,20 @@ def list_credits(limit: int = Query(default=100, ge=1, le=500)) -> list[dict[str
                 expense_at,
                 created_at
             FROM transactions
-            WHERE status != 'ignored' AND category = 'Credit'
+            WHERE status != 'ignored' AND category = 'Credit' AND user_id = ?
             ORDER BY expense_at DESC, id DESC
             LIMIT ?
             """,
-            (limit,),
+            (current_user["id"], limit),
         ).fetchall()
     return [dict(row) for row in rows]
 
 
 @app.post("/expenses", response_model=Expense, status_code=201)
-def create_expense(payload: ExpenseCreate) -> dict[str, Any]:
+def create_expense(
+    payload: ExpenseCreate,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
     logger.info("Create expense payload: %s", payload.model_dump(mode="json"))
     expense_at = (payload.expense_at or datetime.utcnow()).isoformat()
     title = payload.title or payload.note or payload.category
@@ -137,6 +286,7 @@ def create_expense(payload: ExpenseCreate) -> dict[str, Any]:
             """
             INSERT INTO transactions (
                 raw_message_id,
+                user_id,
                 source_type,
                 title,
                 amount,
@@ -152,10 +302,11 @@ def create_expense(payload: ExpenseCreate) -> dict[str, Any]:
                 categorization_strategy,
                 needs_review
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 None,
+                current_user["id"],
                 "manual",
                 title,
                 payload.amount,
@@ -193,7 +344,11 @@ def create_expense(payload: ExpenseCreate) -> dict[str, Any]:
 
 
 @app.put("/expenses/{expense_id}", response_model=Expense)
-def update_expense(expense_id: int, payload: ExpenseUpdate) -> dict[str, Any]:
+def update_expense(
+    expense_id: int,
+    payload: ExpenseUpdate,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
     logger.info(
         "Update expense payload for id=%s: %s",
         expense_id,
@@ -202,8 +357,8 @@ def update_expense(expense_id: int, payload: ExpenseUpdate) -> dict[str, Any]:
     title = payload.title or payload.note or payload.category
     with get_connection() as connection:
         existing = connection.execute(
-            "SELECT id FROM transactions WHERE id = ? AND status != 'ignored'",
-            (expense_id,),
+            "SELECT id FROM transactions WHERE id = ? AND status != 'ignored' AND user_id = ?",
+            (expense_id, current_user["id"]),
         ).fetchone()
         if existing is None:
             raise HTTPException(status_code=404, detail="Expense not found")
@@ -253,15 +408,15 @@ def update_expense(expense_id: int, payload: ExpenseUpdate) -> dict[str, Any]:
     return dict(row)
 
 
-def soft_delete_transaction(transaction_id: int) -> Response:
+def soft_delete_transaction(transaction_id: int, user_id: int) -> Response:
     with get_connection() as connection:
         cursor = connection.execute(
             """
             UPDATE transactions
             SET status = 'ignored', updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND status != 'ignored'
+            WHERE id = ? AND status != 'ignored' AND user_id = ?
             """,
-            (transaction_id,),
+            (transaction_id, user_id),
         )
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Transaction not found")
@@ -269,25 +424,34 @@ def soft_delete_transaction(transaction_id: int) -> Response:
 
 
 @app.delete("/expenses/{expense_id}", status_code=204, response_class=Response)
-def delete_expense(expense_id: int) -> Response:
-    return soft_delete_transaction(expense_id)
+def delete_expense(
+    expense_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> Response:
+    return soft_delete_transaction(expense_id, current_user["id"])
 
 
 @app.delete("/transactions/{transaction_id}", status_code=204, response_class=Response)
-def delete_transaction(transaction_id: int) -> Response:
-    return soft_delete_transaction(transaction_id)
+def delete_transaction(
+    transaction_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> Response:
+    return soft_delete_transaction(transaction_id, current_user["id"])
 
 
 @app.get("/expenses/summary", response_model=ExpenseSummary)
-def get_summary(category: str | None = None) -> dict[str, Any]:
+def get_summary(
+    category: str | None = None,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
     query = """
         SELECT
             COUNT(*) AS total_count,
             COALESCE(SUM(amount), 0) AS total_amount
         FROM transactions
-        WHERE status != 'ignored'
+        WHERE status != 'ignored' AND user_id = ?
     """
-    params: list[Any] = []
+    params: list[Any] = [current_user["id"]]
     if category:
         query += " AND category = ?"
         params.append(category)
@@ -298,13 +462,16 @@ def get_summary(category: str | None = None) -> dict[str, Any]:
 
 
 @app.get("/dashboard", response_model=DashboardResponse)
-def get_dashboard(category: str | None = None) -> dict[str, Any]:
+def get_dashboard(
+    category: str | None = None,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
     summary_query = """
         SELECT
             COUNT(*) AS total_count,
             COALESCE(SUM(amount), 0) AS total_amount
         FROM transactions
-        WHERE status != 'ignored'
+        WHERE status != 'ignored' AND user_id = ?
     """
     category_query = """
         SELECT
@@ -312,10 +479,10 @@ def get_dashboard(category: str | None = None) -> dict[str, Any]:
             COALESCE(SUM(amount), 0) AS total_amount,
             COUNT(*) AS total_count
         FROM transactions
-        WHERE status != 'ignored'
+        WHERE status != 'ignored' AND user_id = ?
     """
-    summary_params: list[Any] = []
-    category_params: list[Any] = []
+    summary_params: list[Any] = [current_user["id"]]
+    category_params: list[Any] = [current_user["id"]]
     if category:
         summary_query += " AND category = ?"
         category_query += " AND category = ?"
@@ -339,6 +506,7 @@ def get_dashboard(category: str | None = None) -> dict[str, Any]:
 @app.get("/dashboard/savings", response_model=SavingsDashboardResponse)
 def get_savings_dashboard(
     limit: int = Query(default=100, ge=1, le=500),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     with get_connection() as connection:
         summary = connection.execute(
@@ -347,8 +515,9 @@ def get_savings_dashboard(
                 COUNT(*) AS total_count,
                 COALESCE(SUM(amount), 0) AS total_amount
             FROM transactions
-            WHERE status != 'ignored' AND category = 'Savings'
-            """
+            WHERE status != 'ignored' AND category = 'Savings' AND user_id = ?
+            """,
+            (current_user["id"],),
         ).fetchone()
         rows = connection.execute(
             """
@@ -362,11 +531,11 @@ def get_savings_dashboard(
                 expense_at,
                 created_at
             FROM transactions
-            WHERE status != 'ignored' AND category = 'Savings'
+            WHERE status != 'ignored' AND category = 'Savings' AND user_id = ?
             ORDER BY expense_at DESC, id DESC
             LIMIT ?
             """,
-            (limit,),
+            (current_user["id"], limit),
         ).fetchall()
 
     return {
@@ -376,13 +545,16 @@ def get_savings_dashboard(
 
 
 @app.post("/receivables", response_model=ReceivableReminder, status_code=201)
-def create_receivable(payload: ReceivableReminderCreate) -> dict[str, Any]:
+def create_receivable(
+    payload: ReceivableReminderCreate,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
     logger.info("Create receivable payload: %s", payload.model_dump(mode="json"))
     with get_connection() as connection:
         if payload.expense_id is not None:
             linked_expense = connection.execute(
-                "SELECT id FROM transactions WHERE id = ? AND status != 'ignored'",
-                (payload.expense_id,),
+                "SELECT id FROM transactions WHERE id = ? AND status != 'ignored' AND user_id = ?",
+                (payload.expense_id, current_user["id"]),
             ).fetchone()
             if linked_expense is None:
                 raise HTTPException(status_code=404, detail="Linked expense not found")
@@ -391,16 +563,18 @@ def create_receivable(payload: ReceivableReminderCreate) -> dict[str, Any]:
             """
             INSERT INTO receivable_reminders (
                 expense_id,
+                user_id,
                 title,
                 amount,
                 note,
                 remind_at,
                 status
             )
-            VALUES (?, ?, ?, ?, ?, 'open')
+            VALUES (?, ?, ?, ?, ?, ?, 'open')
             """,
             (
                 payload.expense_id,
+                current_user["id"],
                 payload.title,
                 payload.amount,
                 payload.note,
@@ -435,6 +609,7 @@ def list_receivables(
     status: str = Query(default="open"),
     due_only: bool = Query(default=False),
     limit: int = Query(default=100, ge=1, le=500),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
     query = """
         SELECT
@@ -450,9 +625,9 @@ def list_receivables(
             created_at,
             updated_at
         FROM receivable_reminders
-        WHERE status = ?
+        WHERE status = ? AND user_id = ?
     """
-    params: list[Any] = [status]
+    params: list[Any] = [status, current_user["id"]]
     if due_only:
         query += " AND remind_at <= ?"
         params.append(utc_now().isoformat())
@@ -468,6 +643,7 @@ def list_receivables(
 def get_receivables_dashboard(
     due_only: bool = Query(default=False),
     limit: int = Query(default=100, ge=1, le=500),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     query = """
         SELECT
@@ -483,9 +659,9 @@ def get_receivables_dashboard(
             created_at,
             updated_at
         FROM receivable_reminders
-        WHERE status = 'open'
+        WHERE status = 'open' AND user_id = ?
     """
-    params: list[Any] = []
+    params: list[Any] = [current_user["id"]]
     if due_only:
         query += " AND remind_at <= ?"
         params.append(utc_now().isoformat())
@@ -495,14 +671,14 @@ def get_receivables_dashboard(
     count_query = """
         SELECT COUNT(*) AS due_count
         FROM receivable_reminders
-        WHERE status = 'open' AND remind_at <= ?
+        WHERE status = 'open' AND user_id = ? AND remind_at <= ?
     """
 
     with get_connection() as connection:
         rows = connection.execute(query, params).fetchall()
         due_count_row = connection.execute(
             count_query,
-            (utc_now().isoformat(),),
+            (current_user["id"], utc_now().isoformat()),
         ).fetchone()
         summary = connection.execute(
             """
@@ -510,8 +686,9 @@ def get_receivables_dashboard(
                 COUNT(*) AS total_count,
                 COALESCE(SUM(amount), 0) AS total_amount
             FROM receivable_reminders
-            WHERE status = 'open'
-            """
+            WHERE status = 'open' AND user_id = ?
+            """,
+            (current_user["id"],),
         ).fetchone()
 
     return {
@@ -525,6 +702,7 @@ def get_receivables_dashboard(
 def mark_receivable_received(
     reminder_id: int,
     payload: ReceivableReminderReceive,
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     logger.info(
         "Receive receivable payload for id=%s: %s",
@@ -538,9 +716,9 @@ def mark_receivable_received(
             """
             SELECT id, title, amount, note, status
             FROM receivable_reminders
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
             """,
-            (reminder_id,),
+            (reminder_id, current_user["id"]),
         ).fetchone()
         if reminder is None:
             raise HTTPException(status_code=404, detail="Receivable reminder not found")
@@ -553,6 +731,7 @@ def mark_receivable_received(
             """
             INSERT INTO transactions (
                 raw_message_id,
+                user_id,
                 source_type,
                 title,
                 amount,
@@ -568,10 +747,11 @@ def mark_receivable_received(
                 categorization_strategy,
                 needs_review
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 None,
+                current_user["id"],
                 "manual",
                 credit_title,
                 float(reminder["amount"]),

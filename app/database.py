@@ -15,6 +15,25 @@ def init_db() -> None:
     with sqlite3.connect(DB_PATH) as connection:
         connection.executescript(
             """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id
+            ON auth_sessions(user_id);
+
             CREATE TABLE IF NOT EXISTS raw_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_type TEXT NOT NULL,
@@ -91,6 +110,32 @@ def init_db() -> None:
             """
         )
 
+        ensure_column(
+            connection,
+            "transactions",
+            "user_id",
+            "INTEGER REFERENCES users(id)",
+        )
+        ensure_column(
+            connection,
+            "receivable_reminders",
+            "user_id",
+            "INTEGER REFERENCES users(id)",
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_transactions_user_id
+            ON transactions(user_id)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_receivable_reminders_user_id
+            ON receivable_reminders(user_id)
+            """
+        )
+
         seed_default_aliases(connection)
         connection.commit()
 
@@ -116,6 +161,23 @@ def seed_default_aliases(connection: sqlite3.Connection) -> None:
         VALUES (?, ?, ?, ?, 'system')
         """,
         aliases,
+    )
+
+
+def ensure_column(
+    connection: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    column_definition: str,
+) -> None:
+    existing_columns = {
+        row[1]
+        for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    if column_name in existing_columns:
+        return
+    connection.execute(
+        f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
     )
 
 
