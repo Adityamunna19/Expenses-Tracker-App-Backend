@@ -1,31 +1,16 @@
 from __future__ import annotations
 
-import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-
-import psycopg2
-from psycopg2.extras import RealDictCursor
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "expenses.db"
 
-# Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL")
-USE_POSTGRESQL = DATABASE_URL is not None
-
 
 def init_db() -> None:
-    if USE_POSTGRESQL:
-        init_postgres_db()
-    else:
-        init_sqlite_db()
-
-
-def init_sqlite_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as connection:
         connection.executescript(
@@ -125,13 +110,13 @@ def init_sqlite_db() -> None:
             """
         )
 
-        ensure_column_sqlite(
+        ensure_column(
             connection,
             "transactions",
             "user_id",
             "INTEGER REFERENCES users(id)",
         )
-        ensure_column_sqlite(
+        ensure_column(
             connection,
             "receivable_reminders",
             "user_id",
@@ -151,140 +136,11 @@ def init_sqlite_db() -> None:
             """
         )
 
-        seed_default_aliases_sqlite(connection)
+        seed_default_aliases(connection)
         connection.commit()
 
 
-def init_postgres_db() -> None:
-    with psycopg2.connect(DATABASE_URL) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    email TEXT NOT NULL UNIQUE,
-                    password_hash TEXT NOT NULL,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-            )
-            
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS auth_sessions (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL,
-                    token_hash TEXT NOT NULL UNIQUE,
-                    expires_at TIMESTAMP NOT NULL,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-                );
-                """
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id ON auth_sessions(user_id);"
-            )
-
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS raw_messages (
-                    id SERIAL PRIMARY KEY,
-                    source_type TEXT NOT NULL,
-                    sender TEXT NOT NULL DEFAULT '',
-                    message_text TEXT NOT NULL,
-                    received_at TIMESTAMP,
-                    parse_status TEXT NOT NULL DEFAULT 'pending',
-                    parse_error TEXT NOT NULL DEFAULT '',
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-            )
-
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS merchant_aliases (
-                    id SERIAL PRIMARY KEY,
-                    alias TEXT NOT NULL UNIQUE,
-                    merchant_clean TEXT NOT NULL,
-                    default_category TEXT NOT NULL,
-                    confidence REAL NOT NULL DEFAULT 0.9,
-                    source TEXT NOT NULL DEFAULT 'system',
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-            )
-
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS transactions (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                    raw_message_id INTEGER REFERENCES raw_messages(id),
-                    source_type TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    amount NUMERIC NOT NULL CHECK(amount >= 0),
-                    currency TEXT NOT NULL DEFAULT 'INR',
-                    category TEXT NOT NULL,
-                    payment_method TEXT NOT NULL DEFAULT 'unknown',
-                    merchant_raw TEXT NOT NULL DEFAULT '',
-                    merchant_clean TEXT NOT NULL DEFAULT '',
-                    expense_at TIMESTAMP NOT NULL,
-                    notes TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL DEFAULT 'pending_review',
-                    categorization_confidence REAL NOT NULL DEFAULT 0,
-                    categorization_strategy TEXT NOT NULL DEFAULT 'rule_based',
-                    needs_review INTEGER NOT NULL DEFAULT 1,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_transactions_expense_at ON transactions(expense_at DESC);"
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(status);"
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_transactions_merchant_clean ON transactions(merchant_clean);"
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON transactions(user_id);"
-            )
-
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS receivable_reminders (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                    expense_id INTEGER REFERENCES transactions(id),
-                    title TEXT NOT NULL,
-                    amount NUMERIC NOT NULL CHECK(amount > 0),
-                    note TEXT NOT NULL DEFAULT '',
-                    remind_at TIMESTAMP NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'open',
-                    received_transaction_id INTEGER REFERENCES transactions(id),
-                    received_at TIMESTAMP,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_receivable_reminders_remind_at ON receivable_reminders(remind_at ASC);"
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_receivable_reminders_status ON receivable_reminders(status);"
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_receivable_reminders_user_id ON receivable_reminders(user_id);"
-            )
-
-            seed_default_aliases_postgres(cursor)
-            connection.commit()
-
-
-def seed_default_aliases_sqlite(connection: sqlite3.Connection) -> None:
+def seed_default_aliases(connection: sqlite3.Connection) -> None:
     aliases = [
         ("swiggy", "Swiggy", "Food", 0.98),
         ("zomato", "Zomato", "Food", 0.98),
@@ -308,32 +164,7 @@ def seed_default_aliases_sqlite(connection: sqlite3.Connection) -> None:
     )
 
 
-def seed_default_aliases_postgres(cursor) -> None:
-    aliases = [
-        ("swiggy", "Swiggy", "Food", 0.98),
-        ("zomato", "Zomato", "Food", 0.98),
-        ("uber", "Uber", "Travel", 0.96),
-        ("ola", "Ola", "Travel", 0.96),
-        ("amazon", "Amazon", "Shopping", 0.95),
-        ("flipkart", "Flipkart", "Shopping", 0.95),
-        ("dmart", "DMart", "Groceries", 0.97),
-        ("bigbasket", "BigBasket", "Groceries", 0.97),
-        ("apollo", "Apollo Pharmacy", "Health", 0.93),
-        ("phonepe", "PhonePe", "Transfers", 0.65),
-        ("gpay", "Google Pay", "Transfers", 0.65),
-    ]
-    cursor.executemany(
-        """
-        INSERT INTO merchant_aliases
-        (alias, merchant_clean, default_category, confidence, source)
-        VALUES (%s, %s, %s, %s, 'system')
-        ON CONFLICT (alias) DO NOTHING
-        """,
-        aliases,
-    )
-
-
-def ensure_column_sqlite(
+def ensure_column(
     connection: sqlite3.Connection,
     table_name: str,
     column_name: str,
@@ -351,25 +182,11 @@ def ensure_column_sqlite(
 
 
 @contextmanager
-def get_connection():
-    """Get a database connection (supports both SQLite and PostgreSQL)"""
-    if USE_POSTGRESQL:
-        connection = psycopg2.connect(DATABASE_URL)
-        connection.set_session(autocommit=False)
-        try:
-            yield connection
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-    else:
-        # SQLite fallback
-        connection = sqlite3.connect(DB_PATH)
-        connection.row_factory = sqlite3.Row
-        try:
-            yield connection
-            connection.commit()
-        finally:
-            connection.close()
+def get_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    try:
+        yield connection
+        connection.commit()
+    finally:
+        connection.close()
