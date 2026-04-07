@@ -1,1 +1,0 @@
-"""Expenses Tracker backend package."""
