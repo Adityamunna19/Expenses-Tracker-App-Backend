@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from agents import smart_agent
 
 # 1. Load Environment Variables
 load_dotenv()
@@ -55,6 +56,7 @@ class Goal(BaseModel):
     target_amount: float
     current_amount: float = 0.0
     user_id: str
+    image_url: Optional[str] = None
 
 class GoalFund(BaseModel):
     amount_to_add: float
@@ -174,6 +176,30 @@ async def fund_goal(goal_id: str, fund: GoalFund, x_user_id: str = Header(None))
     res = supabase.table("savings_goals").update({"current_amount": new_amount})\
         .eq("id", goal_id).execute()
     return res.data[0]
+
+@app.delete("/goals/{goal_id}")
+async def delete_goal(goal_id: str, x_user_id: str = Header(None)):
+    if not x_user_id:
+        raise HTTPException(status_code=401)
+    
+    # Security: Ensure only the owner can delete
+    supabase.table("savings_goals").delete()\
+        .eq("id", goal_id)\
+        .eq("user_id", x_user_id).execute()
+    return {"status": "success"}
+
+@app.get("/goals/research")
+async def research_goal(query: str):
+    if not query:
+        raise HTTPException(status_code=400, detail="What should I search for?")
+    
+    # Let the agent do the work
+    result = smart_agent.fetch_product_data(query)
+    
+    if not result:
+        raise HTTPException(status_code=500, detail="Agent couldn't find info.")
+        
+    return result
 
 # 7. Execution Entry Point
 if __name__ == "__main__":
