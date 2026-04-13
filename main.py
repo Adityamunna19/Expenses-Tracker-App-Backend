@@ -54,6 +54,7 @@ class Transaction(BaseModel):
     sender: Optional[str] = None
     is_recovered: Optional[bool] = False
     expected_recovery_date: Optional[str] = None
+    account_id: Optional[str] = None
 
 class Goal(BaseModel):
     title: str
@@ -68,6 +69,12 @@ class GoalFund(BaseModel):
 class SmartParseRequest(BaseModel):
     text: str
     available_goals: List[Dict[str, Any]] = []
+
+class Account(BaseModel):
+    name: str
+    type: str  # 'bank' or 'card'
+    is_primary: bool = False
+    user_id: str    
 
 # 5. Helper Functions
 def filter_by_date(data, month, year):
@@ -98,8 +105,16 @@ async def get_transactions(x_user_id: str = Header(None)):
 @app.post("/transactions")
 async def add_transaction(transaction: Transaction):
     data = transaction.model_dump()
-    if not data.get('goal_id'):
-        data['goal_id'] = None # Clean up empty string
+    
+    # --- FIX: Clean up date fields to prevent "invalid input syntax" ---
+    if data.get("expected_recovery_date") == "":
+        data["expected_recovery_date"] = None
+    
+    if data.get("date") == "":
+        # If the main transaction date is missing, default to today
+        from datetime import datetime
+        data["date"] = datetime.now().strftime("%Y-%m-%d")
+
     response = supabase.table("transactions").insert(data).execute()
     return response.data[0]
 
@@ -205,6 +220,28 @@ async def research_goal(query: str):
     if not result:
         raise HTTPException(status_code=500, detail="Agent couldn't find info.")
     return result
+
+@app.get("/accounts")
+async def get_accounts(x_user_id: str = Header(None)):
+    if not x_user_id:
+        raise HTTPException(status_code=401)
+    res = supabase.table("accounts").select("*").eq("user_id", x_user_id).order("created_at").execute()
+    return res.data
+
+@app.post("/accounts")
+async def create_account(account: Account):
+    data = account.model_dump()
+    res = supabase.table("accounts").insert(data).execute()
+    return res.data[0]
+
+@app.delete("/accounts/{account_id}")
+async def delete_account(account_id: str, x_user_id: str = Header(None)):
+    if not x_user_id:
+        raise HTTPException(status_code=401)
+    
+    # Delete the account (only if it belongs to this user)
+    supabase.table("accounts").delete().eq("id", account_id).eq("user_id", x_user_id).execute()
+    return {"status": "success"}
 
 if __name__ == "__main__":
     import uvicorn
