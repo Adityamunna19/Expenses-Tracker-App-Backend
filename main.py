@@ -6,6 +6,7 @@ from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from agents import smart_agent
+from image_agent import image_agent
 
 # 1. Load Environment Variables
 load_dotenv()
@@ -76,6 +77,10 @@ class Account(BaseModel):
     is_primary: bool = False
     user_id: str    
 
+class ScreenshotRequest(BaseModel):
+    image: str
+    
+
 # 5. Helper Functions
 def filter_by_date(data, month, year):
     if not month or not year:
@@ -95,6 +100,13 @@ async def smart_parse_endpoint(request: SmartParseRequest):
     return result
 
 # --- TRANSACTION ROUTES ---
+@app.post("/transactions/analyze-screenshot")
+async def analyze_receipt(request: ScreenshotRequest):
+    result = image_agent.analyze_screenshot(request.image)
+    if not result:
+        raise HTTPException(status_code=500, detail="AI Vision failed")
+    return result
+
 @app.get("/transactions")
 async def get_transactions(x_user_id: str = Header(None)):
     if not x_user_id:
