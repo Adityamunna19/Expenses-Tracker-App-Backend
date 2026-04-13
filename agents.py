@@ -5,11 +5,8 @@ from openai import AzureOpenAI
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
 load_dotenv()
 
-# 1. Initialize the Azure OpenAI Client
-# Ensure these keys match your .env file exactly
 client = AzureOpenAI(
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_key=os.getenv("AZURE_OPENAI_KEY"),
@@ -18,33 +15,23 @@ client = AzureOpenAI(
 
 class SmartGoalAgent:
     def __init__(self):
-        # Browser headers to prevent being blocked by search engines
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
         }
 
     def fetch_product_data(self, product_name: str):
-        """
-        Main entry point: Searches the web, then uses Azure GPT-4o to extract price/image.
-        """
         try:
-            # STEP 1: Search the web for raw text data
             search_query = f"{product_name} official price in India April 2026"
             search_url = f"https://www.google.com/search?q={search_query.replace(' ', '+')}"
-            
             response = requests.get(search_url, headers=self.headers, timeout=10)
             
-            # If search fails, we still want the AI to "guess" based on its training data
             web_text = ""
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, 'html.parser')
-                # Extract first 3000 chars of text to avoid token limits
                 web_text = soup.get_text()[:3000]
 
-            # STEP 2: Use Azure GPT-4o to "think" and extract the price
-            # We use a strict System Prompt to prevent the "Zero Price" issue
             completion = client.chat.completions.create(
-                model=os.getenv("AZURE_DEPLOYMENT_NAME"), # Usually "gpt-4o"
+                model=os.getenv("AZURE_DEPLOYMENT_NAME"),
                 messages=[
                     {
                         "role": "system", 
@@ -66,17 +53,12 @@ class SmartGoalAgent:
                 response_format={"type": "json_object"}
             )
 
-            # STEP 3: Parse AI response
             ai_data = json.loads(completion.choices[0].message.content)
-            
             price = ai_data.get("price", 0)
             title = ai_data.get("title", product_name).title()
             keyword = ai_data.get("image_keyword", "gadget")
 
-            # STEP 4: Build high-quality Unsplash URL
-            # This generates a real photo based on the AI's chosen keyword
-            image_url = f"https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?q=80&w=500&auto=format&fit=crop" # Default iPhone
-            
+            image_url = f"https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?q=80&w=500&auto=format&fit=crop"
             if "iphone" not in product_name.lower():
                 image_url = f"https://source.unsplash.com/featured/600x400?{keyword.replace(' ', ',')}"
 
@@ -89,7 +71,6 @@ class SmartGoalAgent:
 
         except Exception as e:
             print(f"❌ Smart Agent Error: {e}")
-            # Robust Fallback to prevent UI crash
             return {
                 "title": product_name.title(),
                 "target_amount": 50000.0,
@@ -97,5 +78,49 @@ class SmartGoalAgent:
                 "status": "fallback"
             }
 
-# Create a single instance to be used by main.py
+   # --- UPDATED FUNCTION FOR SMART EXPENSE ADDING ---
+    def parse_transaction_text(self, text: str, available_goals: list):
+        try:
+            goal_context = json.dumps(available_goals)
+            system_prompt = f"""
+            You are a highly accurate financial parsing assistant. Extract transaction details from the user's text.
+            Return ONLY a raw JSON object.
+            
+            Available Goals for 'Goals' category: {goal_context}
+            
+            Rules:
+            1. Categories MUST be strictly one of: "Food", "Transport", "Bills", "Shopping", "Entertainment", "Savings", "Goals", "Income", "Refund", "Gift", "Other".
+            2. If the text implies saving GENERAL money (e.g., "put 500 in savings", "transferred to vault"), set category to "Savings" and linked_goal_id to null.
+            3. If the text implies saving money for a SPECIFIC item in the Available Goals list (e.g., "save 2000 for macbook"), set category to "Goals" and find the matching goal 'id' for 'linked_goal_id'.
+            4. If spending money on food or transport, DO NOT use "Income" or "Salary".
+            
+            Examples:
+            - "590 KFC" -> {{"title": "KFC", "amount": 590, "category": "Food", "linked_goal_id": null}}
+            - "put 10000 in my savings" -> {{"title": "General Savings", "amount": 10000, "category": "Savings", "linked_goal_id": null}}
+            - "save 2000 for macbook" -> {{"title": "Macbook Fund", "amount": 2000, "category": "Goals", "linked_goal_id": "uuid-here"}}
+            
+            Required JSON Format:
+            {{
+                "title": "Clean Merchant/Source Name",
+                "amount": (float),
+                "category": "String",
+                "linked_goal_id": "UUID string or null"
+            }}
+            """
+
+            completion = client.chat.completions.create(
+                model=os.getenv("AZURE_DEPLOYMENT_NAME"), 
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text}
+                ],
+                response_format={"type": "json_object"}
+            )
+
+            result = json.loads(completion.choices[0].message.content)
+            return result
+
+        except Exception as e:
+            print(f"❌ Smart Parse Error: {e}")
+            return {"title": text, "amount": 0, "category": "Other", "linked_goal_id": None}
 smart_agent = SmartGoalAgent()
