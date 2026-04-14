@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from agents import smart_agent
 from image_agent import image_agent
+from pydantic import BaseModel
 
 # 1. Load Environment Variables
 load_dotenv()
@@ -79,7 +80,10 @@ class Account(BaseModel):
 
 class ScreenshotRequest(BaseModel):
     image: str
-    
+
+class BudgetInput(BaseModel):
+    category: str
+    monthly_limit: float    
 
 # 5. Helper Functions
 def filter_by_date(data, month, year):
@@ -254,6 +258,50 @@ async def delete_account(account_id: str, x_user_id: str = Header(None)):
     # Delete the account (only if it belongs to this user)
     supabase.table("accounts").delete().eq("id", account_id).eq("user_id", x_user_id).execute()
     return {"status": "success"}
+
+@app.get("/budgets")
+async def get_budgets(x_user_id: str = Header(None)):
+    """Fetches all budget limits for the current pilot."""
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized: User ID missing")
+    
+    try:
+        response = supabase.table("budgets").select("*").eq("user_id", x_user_id).execute()
+        return response.data
+    except Exception as e:
+        print(f"Error fetching budgets: {e}")
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+@app.post("/budgets")
+async def upsert_budget(budget: BudgetInput, x_user_id: str = Header(None)):
+    """Sets or updates a budget limit."""
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    try:
+        # 1. Check if a budget already exists for this category
+        existing = supabase.table("budgets").select("id").eq("user_id", x_user_id).eq("category", budget.category).execute()
+        
+        if existing.data:
+            # 2a. UPDATE existing limit
+            supabase.table("budgets") \
+                .update({"monthly_limit": budget.monthly_limit}) \
+                .eq("id", existing.data[0]["id"]) \
+                .execute()
+        else:
+            # 2b. INSERT new limit
+            supabase.table("budgets").insert({
+                "user_id": x_user_id,
+                "category": budget.category,
+                "monthly_limit": budget.monthly_limit
+            }).execute()
+            
+        # Return a simple success message instead of raw data to prevent index errors
+        return {"status": "success", "message": "Budget locked in"}
+        
+    except Exception as e:
+        print(f"Budget Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save budget")
 
 if __name__ == "__main__":
     import uvicorn
