@@ -133,7 +133,26 @@ async def add_transaction(transaction: Transaction):
 
     response = supabase.table("transactions").insert(data).execute()
     return response.data[0]
-
+@app.put("/transactions/{transaction_id}")
+async def update_transaction(transaction_id: str, transaction: dict, x_user_id: str = Header(None)):
+    """Amends an existing transaction."""
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    try:
+        # Prevent users from overwriting secure fields
+        update_data = {k: v for k, v in transaction.items() if k not in ["id", "user_id", "created_at"]}
+        
+        res = supabase.table("transactions") \
+            .update(update_data) \
+            .eq("id", transaction_id) \
+            .eq("user_id", x_user_id) \
+            .execute()
+            
+        return {"status": "success", "message": "Transaction amended"}
+    except Exception as e:
+        print(f"Update Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update transaction")
 @app.delete("/transactions/{transaction_id}")
 async def delete_transaction(transaction_id: str, x_user_id: str = Header(None)):
     if not x_user_id:
