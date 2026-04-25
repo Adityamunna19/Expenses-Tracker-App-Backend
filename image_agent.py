@@ -22,8 +22,12 @@ class ImageAnalyzerAgent:
                         "content": (
                             "You are a financial OCR specialist. Analyze the payment screenshot. "
                             "Extract details and return a JSON object with these EXACT keys: "
-                            "'title' (the merchant name), 'amount' (number), 'date' (YYYY-MM-DD), "
-                            "'payment_method' (UPI or Card), and 'bank_hint' (e.g., sbi, hdfc, kvb)."
+                            "'title' (the merchant or sender name), 'amount' (number), 'date' (YYYY-MM-DD), "
+                            "'payment_method' (UPI or Card), 'bank_hint' (e.g., sbi, hdfc, kvb), "
+                            "and 'type'.\n\n"
+                            "CRITICAL RULE FOR 'type':\n"
+                            "1. If the image says 'Received from', 'Credited to', or shows money coming IN, set 'type': 'credit'.\n"
+                            "2. If the image says 'Paid to', 'Sent to', 'Scan & Pay', or shows money going OUT, set 'type': 'debit'."
                         )
                     },
                     {
@@ -41,8 +45,9 @@ class ImageAnalyzerAgent:
             
             # NORMALIZATION: Ensure keys match your Frontend formData state
             return {
-                "title": raw_data.get("title", "New Expense"),
+                "title": raw_data.get("title", "New Transaction"),
                 "amount": raw_data.get("amount", 0),
+                "type": raw_data.get("type", "debit").lower(), # 👈 CRITICAL FIX: Extract the type!
                 "date": raw_data.get("date", ""),
                 "payment_method": raw_data.get("payment_method", "UPI"),
                 "bank_hint": raw_data.get("bank_hint", "").lower()
@@ -50,4 +55,5 @@ class ImageAnalyzerAgent:
         except Exception as e:
             print(f"Vision Error: {e}")
             return None
+
 image_agent = ImageAnalyzerAgent()
