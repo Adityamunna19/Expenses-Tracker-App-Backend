@@ -5,6 +5,5 @@ python-dotenv
 requests
 beautifulsoup4
 openai
-dotenv
 APScheduler
 firebase-admin

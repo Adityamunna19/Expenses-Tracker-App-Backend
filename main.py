@@ -45,13 +45,14 @@ app.add_middleware(
 
 # 4. Data Models
 class Transaction(BaseModel):
-    title: str
+    title: Optional[str] = None
     amount: float
-    type: str  # 'debit', 'credit', or 'transfer'
-    category: str
-    user_id: str
+    type: Optional[str] = None  # 'debit', 'credit', or 'transfer'
+    category: Optional[str] = None
+    user_id: Optional[str] = None
     
     payment_method: Optional[str] = "UPI"
+    payment_mode: Optional[str] = None
     date: Optional[str] = None
     note: Optional[str] = ""
     is_secret: Optional[bool] = False
@@ -64,6 +65,8 @@ class Transaction(BaseModel):
     expected_recovery_date: Optional[str] = None
     account_id: Optional[str] = None
     to_account_id: Optional[str] = None
+    is_loan: bool = False
+    loan_category: Optional[str] = None
 
 class TransactionUpdate(BaseModel):
     title: Optional[str] = None
@@ -173,8 +176,32 @@ async def get_transactions(month: Optional[int] = None, year: Optional[int] = No
     return response.data
 
 @app.post("/transactions")
-async def add_transaction(transaction: Transaction):
+async def add_transaction(transaction: Transaction, x_user_id: str = Header(None)):
     data = transaction.model_dump()
+
+    # Accept user id from header when frontend doesn't send it in payload.
+    data["user_id"] = data.get("user_id") or x_user_id
+    if not data["user_id"]:
+        raise HTTPException(status_code=422, detail="user_id is required (body.user_id or x-user-id header)")
+
+    # Backward compatibility for older frontend payload key.
+    if data.get("payment_mode") and not data.get("payment_method"):
+        data["payment_method"] = data["payment_mode"]
+    data.pop("payment_mode", None)
+
+    # Loan entries often omit generic fields; normalize them safely.
+    if data.get("is_loan"):
+        if not data.get("category"):
+            data["category"] = data.get("loan_category") or "Loan"
+        if not data.get("title"):
+            data["title"] = "Loan Entry"
+        if not data.get("type"):
+            data["type"] = "debit"
+
+    # Fallbacks for non-loan/partial payloads.
+    data["title"] = (data.get("title") or "").strip() or "Transaction"
+    data["type"] = data.get("type") or "debit"
+    data["category"] = data.get("category") or "General"
     
     if data.get("expected_recovery_date") == "":
         data["expected_recovery_date"] = None
@@ -185,6 +212,10 @@ async def add_transaction(transaction: Transaction):
 
     if data.get('type') != 'transfer':
         data['to_account_id'] = None
+
+    # These are app-level helper fields; avoid DB errors if columns do not exist.
+    data.pop("is_loan", None)
+    data.pop("loan_category", None)
 
     response = supabase.table("transactions").insert(data).execute()
     return response.data[0]
@@ -208,6 +239,10 @@ async def update_transaction(transaction_id: str, payload: TransactionUpdate, x_
     # Non-transfer rows should not carry destination account.
     if update_data.get("type") and update_data["type"] != "transfer":
         update_data["to_account_id"] = None
+
+    # Defensive cleanup in case frontend sends non-schema helper fields.
+    update_data.pop("is_loan", None)
+    update_data.pop("loan_category", None)
 
     try:
         existing = (
