@@ -12,8 +12,10 @@ client = AzureOpenAI(
 )
 
 class ImageAnalyzerAgent:
-    def analyze_screenshot(self, base64_image: str):
+    def analyze_screenshot(self, base64_image: str, merchant_aliases: dict = None):
         try:
+            aliases_context = json.dumps(merchant_aliases) if merchant_aliases else "None"
+            
             completion = client.chat.completions.create(
                 model=os.getenv("AZURE_DEPLOYMENT_NAME"),
                 messages=[
@@ -27,7 +29,8 @@ class ImageAnalyzerAgent:
                             "and 'type'.\n\n"
                             "CRITICAL RULE FOR 'type':\n"
                             "1. If the image says 'Received from', 'Credited to', or shows money coming IN, set 'type': 'credit'.\n"
-                            "2. If the image says 'Paid to', 'Sent to', 'Scan & Pay', or shows money going OUT, set 'type': 'debit'."
+                            "2. If the image says 'Paid to', 'Sent to', 'Scan & Pay', or shows money going OUT, set 'type': 'debit'.\n"
+                            f"3. ALIAS RULE: If the extracted merchant/sender name matches any key in {aliases_context}, replace the 'title' with the mapped value."
                         )
                     },
                     {

@@ -1,11 +1,13 @@
 import os
+import re
+import json
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from agents import smart_agent
+from agents import smart_agent, release_agent
 from image_agent import image_agent
 from scheduler import start_scheduler
 from collections import defaultdict
@@ -97,9 +99,22 @@ class Goal(BaseModel):
 class GoalFund(BaseModel):
     amount_to_add: float
 
+class CategoryModel(BaseModel):
+    name: str
+    type: Optional[str] = "expense"
+    user_id: Optional[str] = None
+
+class Note(BaseModel):
+    title: Optional[str] = None
+    content: str
+    date: Optional[str] = None
+    user_id: Optional[str] = None
+
 class SmartParseRequest(BaseModel):
     text: str
     available_goals: List[Dict[str, Any]] = []
+    merchant_aliases: Optional[Dict[str, str]] = None
+    custom_categories: Optional[List[str]] = None
 
 class Account(BaseModel):
     name: Optional[str] = None
@@ -107,9 +122,11 @@ class Account(BaseModel):
     is_primary: Optional[bool] = None
     user_id: Optional[str] = None
     credit_limit: Optional[float] = None
+    balance: Optional[float] = 0.0
 
 class ScreenshotRequest(BaseModel):
     image: str
+    merchant_aliases: Optional[Dict[str, str]] = None
 
 class BudgetInput(BaseModel):
     category: str
@@ -117,6 +134,9 @@ class BudgetInput(BaseModel):
 
 class PushToken(BaseModel):
     token: str    
+
+class CommitMessages(BaseModel):
+    commits: List[str]
 
 # 6. API Routes
 @app.get("/")
@@ -126,7 +146,12 @@ async def health_check():
 # --- SMART PARSE ROUTE ---
 @app.post("/smart-parse")
 async def smart_parse_endpoint(request: SmartParseRequest):
-    result = smart_agent.parse_transaction_text(request.text, request.available_goals)
+    result = smart_agent.parse_transaction_text(
+        text=request.text, 
+        available_goals=request.available_goals,
+        merchant_aliases=request.merchant_aliases,
+        custom_categories=request.custom_categories
+    )
     return result
 
 # --- SETTINGS / PUSH NOTIFICATIONS ---
@@ -152,7 +177,7 @@ async def save_push_token(payload: PushToken, x_user_id: str = Header(None)):
 # --- TRANSACTION ROUTES ---
 @app.post("/transactions/analyze-screenshot")
 async def analyze_receipt(request: ScreenshotRequest):
-    result = image_agent.analyze_screenshot(request.image)
+    result = image_agent.analyze_screenshot(request.image, merchant_aliases=request.merchant_aliases)
     if not result:
         raise HTTPException(status_code=500, detail="AI Vision failed")
     return result
@@ -218,7 +243,35 @@ async def add_transaction(transaction: Transaction, x_user_id: str = Header(None
     data.pop("loan_category", None)
 
     response = supabase.table("transactions").insert(data).execute()
-    return response.data[0]
+    new_tx = response.data[0]
+    
+    # --- Account Balances & Loan / Savings Handlers ---
+    try:
+        if data.get("account_id"):
+            acc_res = supabase.table("accounts").select("balance, type").eq("id", data["account_id"]).execute()
+            if acc_res.data:
+                current_bal = acc_res.data[0].get("balance") or 0.0
+                new_bal = current_bal - data["amount"] if data["type"] == "debit" else current_bal + data["amount"]
+                
+                # If income is categorized as "Savings", it implies a withdrawal from the total savings balance
+                if data["type"] == "credit" and data.get("category", "").lower() == "savings":
+                    new_bal = current_bal - data["amount"]
+                    
+                supabase.table("accounts").update({"balance": new_bal}).eq("id", data["account_id"]).execute()
+
+        if data.get("to_account_id"):
+            to_acc_res = supabase.table("accounts").select("balance, type").eq("id", data["to_account_id"]).execute()
+            if to_acc_res.data:
+                to_current_bal = to_acc_res.data[0].get("balance") or 0.0
+                acc_type = to_acc_res.data[0].get("type") or ""
+                
+                # If transferring TO a loan account, reduce the debt balance
+                new_to_bal = to_current_bal - data["amount"] if acc_type.lower() == "loan" else to_current_bal + data["amount"]
+                supabase.table("accounts").update({"balance": new_to_bal}).eq("id", data["to_account_id"]).execute()
+    except Exception as e:
+        print(f"Failed to update account balances: {e}")
+
+    return new_tx
 
 @app.put("/transactions/{transaction_id}")
 @app.patch("/transactions/{transaction_id}")
@@ -361,7 +414,7 @@ async def get_stats(month: Optional[int] = None, year: Optional[int] = None, x_u
     if not x_user_id:
         raise HTTPException(status_code=401)
     
-    query = supabase.table("transactions").select("amount, type").eq("user_id", x_user_id)
+    query = supabase.table("transactions").select("amount, type, category").eq("user_id", x_user_id)
     if month and year:
         start_date = f"{year}-{month:02d}-01"
         if month == 12:
@@ -374,7 +427,7 @@ async def get_stats(month: Optional[int] = None, year: Optional[int] = None, x_u
     data = res.data or []
     
     total_in = sum(item['amount'] for item in data if item['type'] == 'credit')
-    total_out = sum(item['amount'] for item in data if item['type'] == 'debit')
+    total_out = sum(item['amount'] for item in data if item['type'] == 'debit' or item.get('category', '').lower() == 'credit card')
     return {"total_in": total_in, "total_out": total_out, "net": total_in - total_out}
 
 @app.get("/analytics")
@@ -382,7 +435,7 @@ async def get_analytics(month: Optional[int] = None, year: Optional[int] = None,
     if not x_user_id:
         raise HTTPException(status_code=401)
         
-    query = supabase.table("transactions").select("amount, category").eq("type", "debit").eq("user_id", x_user_id)
+    query = supabase.table("transactions").select("amount, category, type").eq("user_id", x_user_id)
     if month and year:
         start_date = f"{year}-{month:02d}-01"
         if month == 12:
@@ -396,8 +449,9 @@ async def get_analytics(month: Optional[int] = None, year: Optional[int] = None,
     
     cat_data = {}
     for row in data:
-        cat = row['category']
-        cat_data[cat] = cat_data.get(cat, 0) + row['amount']
+        if row['type'] == 'debit' or row.get('category', '').lower() == 'credit card':
+            cat = row['category']
+            cat_data[cat] = cat_data.get(cat, 0) + row['amount']
     categories = sorted([{"name": k, "value": v} for k, v in cat_data.items()], key=lambda x: x['value'], reverse=True)
     return {"categories": categories}
 
@@ -538,6 +592,84 @@ async def get_subscriptions(x_user_id: str = Header(None)):
     except Exception as e:
         print(f"Subscription Engine Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to analyze subscriptions")    
+
+# --- CUSTOM CATEGORIES ---
+@app.get("/categories")
+async def get_categories(x_user_id: str = Header(None)):
+    if not x_user_id:
+        raise HTTPException(status_code=401)
+    res = supabase.table("categories").select("*").eq("user_id", x_user_id).execute()
+    return res.data
+
+@app.post("/categories")
+async def create_category(category: CategoryModel, x_user_id: str = Header(None)):
+    if not x_user_id:
+        raise HTTPException(status_code=401)
+    data = category.model_dump(exclude_unset=True)
+    data["user_id"] = x_user_id
+    res = supabase.table("categories").insert(data).execute()
+    return res.data[0] if res.data else {"status": "success"}
+
+@app.delete("/categories/{category_id}")
+async def delete_category(category_id: str, x_user_id: str = Header(None)):
+    if not x_user_id:
+        raise HTTPException(status_code=401)
+    supabase.table("categories").delete().eq("id", category_id).eq("user_id", x_user_id).execute()
+    return {"status": "success"}
+
+# --- PERSONAL DIARY (NOTES) ---
+@app.get("/notes")
+async def get_notes(x_user_id: str = Header(None)):
+    if not x_user_id:
+        raise HTTPException(status_code=401)
+    res = supabase.table("notes").select("*").eq("user_id", x_user_id).order("created_at", desc=True).execute()
+    return res.data
+
+@app.post("/notes")
+async def create_note(note: Note, x_user_id: str = Header(None)):
+    if not x_user_id:
+        raise HTTPException(status_code=401)
+    data = note.model_dump(exclude_unset=True)
+    data["user_id"] = x_user_id
+    if not data.get("date"):
+        data["date"] = datetime.now().strftime("%Y-%m-%d")
+    res = supabase.table("notes").insert(data).execute()
+    return res.data[0] if res.data else {"status": "success"}
+
+@app.delete("/notes/{note_id}")
+async def delete_note(note_id: str, x_user_id: str = Header(None)):
+    if not x_user_id:
+        raise HTTPException(status_code=401)
+    supabase.table("notes").delete().eq("id", note_id).eq("user_id", x_user_id).execute()
+    return {"status": "success"}
+
+# --- ANNOUNCEMENTS / RELEASE NOTES ---
+@app.post("/admin/announcements/generate")
+async def generate_and_publish_announcement(payload: CommitMessages, x_admin_key: str = Header(None)):
+    # Optional: You can check `x_admin_key` against an environment variable to secure this route
+    announcement_data = release_agent.generate_release_notes(payload.commits)
+    
+    if not announcement_data:
+        raise HTTPException(status_code=500, detail="Failed to generate release notes via AI")
+        
+    title_str = announcement_data.get("title", "New Update")
+    slug = re.sub(r'[^a-z0-9]+', '-', title_str.lower()).strip('-')
+
+    # We map the JSON result into the `content` field so it fits the existing `announcements` table
+    insert_data = {
+        "title": title_str,
+        "content": json.dumps({
+            "summary": announcement_data.get("summary"),
+            "highlights": announcement_data.get("highlights"),
+            "cta_label": announcement_data.get("cta_label"),
+            "cta_subtext": announcement_data.get("cta_subtext")
+        }),
+        "version_tag": slug,
+        "is_active": True
+    }
+    
+    res = supabase.table("announcements").insert(insert_data).execute()
+    return res.data[0] if res.data else {"status": "success"}
 
 if __name__ == "__main__":
     import uvicorn
